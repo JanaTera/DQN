@@ -1,0 +1,188 @@
+import cv2 as cv
+import numpy as np
+import socket
+import struct
+import tensorflow as tf
+from tensorflow.keras import models, layers
+import random
+from collections import deque
+import time
+
+# Constants for head movement
+YAW_MIN, YAW_MAX = -1.8, 1.8
+PITCH_MIN, PITCH_MAX = -0.610, 0.610
+YAW_STEP_SIZE = 0.3
+PITCH_STEP_SIZE = 0.2
+
+# Action Space
+ACTIONS = [
+    (yaw, pitch)
+    for yaw in np.arange(YAW_MIN, YAW_MAX + YAW_STEP_SIZE, YAW_STEP_SIZE)
+    for pitch in np.arange(PITCH_MIN, PITCH_MAX + PITCH_STEP_SIZE, PITCH_STEP_SIZE)
+]
+
+# DQN Hyperparameters
+STATE_SIZE = (84, 84, 1)  # Grayscale for efficiency
+ACTION_SPACE_SIZE = len(ACTIONS)
+GAMMA = 0.95
+EPSILON = 1.0
+EPSILON_DECAY = 0.995
+MIN_EPSILON = 0.01
+BATCH_SIZE = 64
+LEARNING_RATE = 0.0001
+TARGET_UPDATE = 5
+
+# Replay Memory
+memory = deque(maxlen=2000)
+
+# Model Building
+def build_model():
+    model = models.Sequential([
+        layers.Conv2D(32, (8, 8), strides=(4, 4), activation='relu', input_shape=STATE_SIZE),
+        layers.Conv2D(64, (4, 4), strides=(2, 2), activation='relu'),
+        layers.Conv2D(64, (3, 3), activation='relu'),
+        layers.Flatten(),
+        layers.Dense(512, activation='relu'),
+        layers.Dense(ACTION_SPACE_SIZE, activation='linear')
+    ])
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE), loss='mse')
+    return model
+
+dqn_model = build_model()
+target_model = build_model()
+target_model.set_weights(dqn_model.get_weights())
+
+# Action Selection
+def choose_action(state):
+    global EPSILON
+    if np.random.rand() <= EPSILON:
+        return random.choice(ACTIONS)
+    q_values = dqn_model.predict(np.expand_dims(state, axis=0), verbose=0)
+    return ACTIONS[np.argmax(q_values[0])]
+
+# Store Transition
+def store_transition(state, action, reward, next_state, done):
+    memory.append((state, action, reward, next_state, done))
+
+# Training the DQN
+def train_dqn():
+    if len(memory) < BATCH_SIZE:
+        return
+    minibatch = random.sample(memory, BATCH_SIZE)
+    states = np.array([transition[0] for transition in minibatch])
+    actions = [ACTIONS.index(transition[1]) for transition in minibatch]
+    rewards = np.array([transition[2] for transition in minibatch])
+    next_states = np.array([transition[3] for transition in minibatch])
+    dones = np.array([transition[4] for transition in minibatch])
+
+    target_qs = dqn_model.predict(states)
+    next_qs = target_model.predict(next_states)
+    for idx, (action_idx, reward, done) in enumerate(zip(actions, rewards, dones)):
+        if done:
+            target_qs[idx][action_idx] = reward
+        else:
+            target_qs[idx][action_idx] = reward + GAMMA * np.max(next_qs[idx])
+    dqn_model.fit(states, target_qs, epochs=1, verbose=0)
+
+# Reward Calculation
+def calculate_reward(ball_position, frame_center):
+    if ball_position is None:
+        return -1.0
+    distance = np.linalg.norm(np.array(ball_position) - np.array(frame_center))
+    return 1.0 - (distance / np.linalg.norm(frame_center))
+
+# Detect Color Object
+def detect_color_object(frame, target_color=(0, 0, 255), kernel_size=7, min_area=500, debug=True):
+    hsv = cv.cvtColor(frame, cv.COLOR_BGR2HSV)
+    lower_red1 = np.array([0, 120, 70])
+    upper_red1 = np.array([10, 255, 255])
+    lower_red2 = np.array([170, 120, 70])
+    upper_red2 = np.array([180, 255, 255])
+    mask1 = cv.inRange(hsv, lower_red1, upper_red1)
+    mask2 = cv.inRange(hsv, lower_red2, upper_red2)
+    mask = mask1 | mask2
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    mask = cv.morphologyEx(mask, cv.MORPH_CLOSE, kernel)
+    mask = cv.morphologyEx(mask, cv.MORPH_OPEN, kernel)
+
+    contours, _ = cv.findContours(mask, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
+    ball_position = None
+
+    for contour in contours:
+        area = cv.contourArea(contour)
+        if area > min_area:
+            (x, y), radius = cv.minEnclosingCircle(contour)
+            center = (int(x), int(y))
+            if radius > 0:
+                ball_position = center
+                if debug:
+                    cv.circle(frame, center, int(radius), target_color, 2)
+                    cv.circle(frame, center, 5, (0, 255, 0), -1)
+                break
+    return ball_position
+
+# Socket Initialization
+client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+client_socket.connect(('1.1.1.244', 65432))
+
+try:
+    for episode in range(100):
+        print("Episode {} - Starting EPSILON: {}".format(episode + 1, EPSILON))
+        image_path = r"C:\\Users\\ADMIN\\Downloads\\Nao\\image_1.jpg"
+        image = cv.imread(image_path, cv.IMREAD_GRAYSCALE)
+        if image is None:
+            print("Error: Could not load image at {}".format(image_path))
+            exit(1)
+        image = cv.resize(image, (84, 84))
+        state = np.array(image) / 255.0
+        state = np.expand_dims(state, axis=-1)
+        done = False
+        MAX_STEPS = 100
+        threshold_distance = 10
+        step_count = 0
+
+        while not done:
+            step_count += 1
+            action = choose_action(state)
+            head_yaw, head_pitch = action
+            print("Step {} - Yaw: {}, Pitch: {}".format(step_count, head_yaw, head_pitch))
+            data = struct.pack("!ff", head_yaw, head_pitch)
+            client_socket.sendall(data)
+            flag = client_socket.recv(8)
+            
+            # Convert grayscale to BGR for color detection
+            image = cv.cvtColor(image, cv.COLOR_GRAY2BGR)
+            ball_position = detect_color_object(image)
+            
+            # Process next state
+            next_image = cv.imread(image_path, cv.IMREAD_GRAYSCALE)
+            next_image = cv.resize(next_image, (84, 84))
+            next_state = np.array(next_image) / 255.0
+            next_state = np.expand_dims(next_state, axis=-1)
+
+            height, width = next_image.shape[:2]
+            frame_center = (width // 2, height // 2)
+            reward = calculate_reward(ball_position, frame_center)
+            print("Step {} - Reward: {}".format(step_count, reward))
+
+            store_transition(state, action, reward, next_state, done)
+            train_dqn()
+            state = next_state
+
+            if ball_position is None or step_count >= MAX_STEPS:
+                done = True
+            else:
+                distance = np.linalg.norm(np.array(ball_position) - np.array(frame_center))
+                if distance < threshold_distance:
+                    done = True
+
+        if EPSILON > MIN_EPSILON:
+            EPSILON *= EPSILON_DECAY
+            print("Episode {} - Decayed EPSILON: {}".format(episode + 1, EPSILON))
+
+        if episode % TARGET_UPDATE == 0:
+            target_model.set_weights(dqn_model.get_weights())
+    dqn_model.save("dqn_trained_model.h5")
+
+finally:
+    client_socket.close()
